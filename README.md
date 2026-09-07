@@ -13,7 +13,8 @@ Benchmarking a GPU's performance for my use case.
    - 4b：双 session（每个 session 固定对应一个发送线程）
 
 每个小场景都记录：
-- 单图推理耗时（不含图像读取时间）
+- 场景 1：单图推理耗时（不含图像读取时间）
+- 场景 2/3/4：每个请求组从提交到该组全部处理完成的耗时
 - 峰值显存占用
 - 峰值带宽占用（NVML memory utilization）
 

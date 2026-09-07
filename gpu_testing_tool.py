@@ -254,6 +254,23 @@ def run_inference_batch(
     return results
 
 
+def run_grouped_inference_batches(
+    workers: List[SessionWorker],
+    grouped_assignments: List[List[Tuple[int, str, np.ndarray]]],
+) -> List[InferenceResult]:
+    result_queue: "queue.Queue[InferenceResult]" = queue.Queue()
+    group_results: List[InferenceResult] = []
+    for group_idx, assignments in enumerate(grouped_assignments, start=1):
+        start = time.perf_counter()
+        for worker_idx, image_name, arr in assignments:
+            workers[worker_idx].submit(image_name, arr, result_queue)
+        for _ in assignments:
+            result_queue.get()
+        elapsed = (time.perf_counter() - start) * 1000.0
+        group_results.append(InferenceResult(image_name=f"request_group_{group_idx}", latency_ms=elapsed))
+    return group_results
+
+
 def scenario1_sequential(
     model_path: str,
     ep: str,
@@ -301,7 +318,8 @@ def scenario2_task_concurrency(
                 assignments = []
                 for i, (name, arr) in enumerate(prepared_images):
                     assignments.append((0, f"{name}#sender{i % concurrency}", arr))
-                results = run_inference_batch([worker], assignments)
+                grouped_assignments = [assignments[i : i + concurrency] for i in range(0, len(assignments), concurrency)]
+                results = run_grouped_inference_batches([worker], grouped_assignments)
             finally:
                 monitor.stop()
             all_results.append(
@@ -353,7 +371,8 @@ def scenario3_session_concurrency(
             monitor = GPUMonitor()
             monitor.start()
             try:
-                results = run_inference_batch(workers, assignments)
+                grouped_assignments = [assignments[i : i + sender_count] for i in range(0, len(assignments), sender_count)]
+                results = run_grouped_inference_batches(workers, grouped_assignments)
             finally:
                 monitor.stop()
 
@@ -402,7 +421,6 @@ def scenario4_fixed_interval(
 
     def run_subscenario(name: str, workers: List[SessionWorker], fixed_map: Optional[Dict[int, int]] = None):
         print_status(f"scenario4 running sub-scenario={name}")
-        result_queue: "queue.Queue[InferenceResult]" = queue.Queue()
         monitor = GPUMonitor()
         monitor.start()
         try:
@@ -415,24 +433,28 @@ def scenario4_fixed_interval(
                     worker_idx = i % len(workers)
                 sender_jobs[sender_id].append((worker_idx, f"{img_name}#sender{sender_id}", arr))
 
-            sent_counter = {"count": 0}
-            send_lock = threading.Lock()
+            grouped_assignments: List[List[Tuple[int, str, np.ndarray]]] = []
+            total_rounds = max(len(sender_jobs[0]), len(sender_jobs[1]))
+            for round_idx in range(total_rounds):
+                assignments = []
+                for sender_id in range(2):
+                    if round_idx < len(sender_jobs[sender_id]):
+                        assignments.append(sender_jobs[sender_id][round_idx])
+                if assignments:
+                    grouped_assignments.append(assignments)
 
-            def sender_thread_fn(jobs: List[Tuple[int, str, np.ndarray]]):
-                for worker_idx, image_name, arr in jobs:
+            results = []
+            result_queue: "queue.Queue[InferenceResult]" = queue.Queue()
+            for round_idx, assignments in enumerate(grouped_assignments):
+                start = time.perf_counter()
+                for worker_idx, image_name, arr in assignments:
                     workers[worker_idx].submit(image_name, arr, result_queue)
-                    with send_lock:
-                        sent_counter["count"] += 1
+                for _ in assignments:
+                    result_queue.get()
+                elapsed = (time.perf_counter() - start) * 1000.0
+                results.append(InferenceResult(image_name=f"request_group_{round_idx + 1}", latency_ms=elapsed))
+                if round_idx != len(grouped_assignments) - 1:
                     time.sleep(interval_ms / 1000.0)
-
-            senders = [threading.Thread(target=sender_thread_fn, args=(sender_jobs[i],), daemon=True) for i in range(2)]
-            for t in senders:
-                t.start()
-            for t in senders:
-                t.join()
-
-            total = sent_counter["count"]
-            results = [result_queue.get() for _ in range(total)]
         finally:
             monitor.stop()
 
@@ -523,7 +545,10 @@ def write_results_to_excel(
         ws.append(["peak_memory_mb", sr.peak_memory_mb])
         ws.append(["peak_bandwidth_percent", sr.peak_bandwidth_percent])
         ws.append([])
-        ws.append(["image_name", "latency_ms"])
+        if sr.scenario_name.startswith(("scenario2_", "scenario3_", "scenario4_")):
+            ws.append(["request_group", "processing_time_ms"])
+        else:
+            ws.append(["image_name", "latency_ms"])
         for row in sr.per_image:
             ws.append([row.image_name, row.latency_ms])
 

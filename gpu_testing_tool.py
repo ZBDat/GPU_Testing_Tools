@@ -369,12 +369,12 @@ def scenario3_session_concurrency(
             print_status(f"scenario3 completed sessions={session_count}/{max_sessions}")
         except Exception as exc:
             if _is_oom_error(exc):
-            print_status(f"scenario3 OOM detected at sessions={session_count}, stopping session scaling")
-            scenario_results.append(
-                ScenarioResult(
-                    scenario_name=f"scenario3_session_concurrency_{session_count}_oom",
-                    details="OOM detected and recovered",
-                    per_image=[],
+                print_status(f"scenario3 OOM detected at sessions={session_count}, stopping session scaling")
+                scenario_results.append(
+                    ScenarioResult(
+                        scenario_name=f"scenario3_session_concurrency_{session_count}_oom",
+                        details="OOM detected and recovered",
+                        per_image=[],
                         peak_memory_mb=0.0,
                         peak_bandwidth_percent=0.0,
                     )

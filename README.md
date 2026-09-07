@@ -24,6 +24,7 @@ Benchmarking a GPU's performance for my use case.
 - 图像大小与 shape
 
 运行前会先执行单图单次推理并在命令行打印结果，用于验证模型可用性。
+运行过程中会持续输出 `[STATUS]` 日志，指示启动、各场景开始/完成以及并发子场景进度。
 
 ### 依赖
 

@@ -294,6 +294,7 @@ def scenario2_task_concurrency(
     all_results: List[ScenarioResult] = []
     try:
         for concurrency in range(2, max_concurrency + 1):
+            print_status(f"scenario2 running concurrency={concurrency}/{max_concurrency}")
             monitor = GPUMonitor()
             monitor.start()
             try:
@@ -312,6 +313,7 @@ def scenario2_task_concurrency(
                     peak_bandwidth_percent=monitor.peak_bandwidth_percent,
                 )
             )
+            print_status(f"scenario2 completed concurrency={concurrency}/{max_concurrency}")
     finally:
         worker.stop()
         worker.join(timeout=1.0)
@@ -332,6 +334,7 @@ def scenario3_session_concurrency(
 ) -> List[ScenarioResult]:
     scenario_results: List[ScenarioResult] = []
     for session_count in range(2, max_sessions + 1):
+        print_status(f"scenario3 running sessions={session_count}/{max_sessions}")
         workers: List[SessionWorker] = []
         try:
             for i in range(session_count):
@@ -363,8 +366,10 @@ def scenario3_session_concurrency(
                     peak_bandwidth_percent=monitor.peak_bandwidth_percent,
                 )
             )
+            print_status(f"scenario3 completed sessions={session_count}/{max_sessions}")
         except Exception as exc:
             if _is_oom_error(exc):
+                print_status(f"scenario3 OOM detected at sessions={session_count}, stopping session scaling")
                 scenario_results.append(
                     ScenarioResult(
                         scenario_name=f"scenario3_session_concurrency_{session_count}_oom",
@@ -396,6 +401,7 @@ def scenario4_fixed_interval(
         raise RuntimeError("Scenario 4 requires at least 2 images")
 
     def run_subscenario(name: str, workers: List[SessionWorker], fixed_map: Optional[Dict[int, int]] = None):
+        print_status(f"scenario4 running sub-scenario={name}")
         result_queue: "queue.Queue[InferenceResult]" = queue.Queue()
         monitor = GPUMonitor()
         monitor.start()
@@ -430,13 +436,15 @@ def scenario4_fixed_interval(
         finally:
             monitor.stop()
 
-        return ScenarioResult(
+        result = ScenarioResult(
             scenario_name=name,
             details=f"fixed_interval_{interval_ms}ms",
             per_image=results,
             peak_memory_mb=monitor.peak_memory_bytes / (1024 * 1024),
             peak_bandwidth_percent=monitor.peak_bandwidth_percent,
         )
+        print_status(f"scenario4 completed sub-scenario={name}")
+        return result
 
     single_session = create_session(model_path, ep)
     worker_a = SessionWorker(0, single_session, input_name)
@@ -540,18 +548,27 @@ def print_single_inference_verification(session: Any, input_name: str, image_nam
     print(f"[VERIFY] single-image inference success: image={image_name}, latency_ms={elapsed:.3f}, output={summary}")
 
 
+def print_status(message: str):
+    print(f"[STATUS] {message}", flush=True)
+
+
 def main():
     args = parse_args()
     if ort is None:
         raise RuntimeError("onnxruntime is required to run this tool")
 
+    print_status("GPU benchmark started")
+    print_status(f"execution_provider={args.ep}, image_dir={args.image_dir}, model={args.model}")
+    print_status("loading model and probing input metadata")
     probe_session = create_session(args.model, args.ep)
     input_meta = probe_session.get_inputs()[0]
     input_name = input_meta.name
     onnx_input_name, onnx_shape = get_model_info(args.model)
     target_shape = onnx_shape if onnx_shape else [d if isinstance(d, int) else None for d in input_meta.shape]
     target_dtype = resolve_numpy_dtype(input_meta.type)
+    print_status("loading and preparing images")
     prepared_images = load_and_prepare_images(args.image_dir, target_shape, target_dtype, args.max_images)
+    print_status(f"prepared_images={len(prepared_images)}")
     first_image_path = os.path.join(args.image_dir, prepared_images[0][0])
 
     print(
@@ -561,18 +578,28 @@ def main():
     print_single_inference_verification(probe_session, input_name, prepared_images[0][0], prepared_images[0][1])
 
     all_results: List[ScenarioResult] = []
+    print_status("running scenario 1: sequential")
     all_results.append(scenario1_sequential(args.model, args.ep, input_name, prepared_images))
+    print_status("scenario 1 completed")
+    print_status("running scenario 2: task concurrency")
     all_results.extend(
         scenario2_task_concurrency(args.model, args.ep, input_name, prepared_images, args.max_task_concurrency)
     )
+    print_status("scenario 2 completed")
+    print_status("running scenario 3: session concurrency")
     all_results.extend(
         scenario3_session_concurrency(args.model, args.ep, input_name, prepared_images, args.max_session_concurrency)
     )
+    print_status("scenario 3 completed")
+    print_status("running scenario 4: fixed interval")
     all_results.extend(
         scenario4_fixed_interval(args.model, args.ep, input_name, prepared_images, args.interval_ms)
     )
+    print_status("scenario 4 completed")
 
+    print_status("collecting environment information")
     env_info = get_environment_info(args.model, first_image_path, tuple(prepared_images[0][1].shape))
+    print_status("writing results to Excel")
     write_results_to_excel(args.output_excel, env_info, all_results)
     print(f"[DONE] results saved to {args.output_excel}")
 

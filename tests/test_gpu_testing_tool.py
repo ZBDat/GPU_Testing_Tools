@@ -37,6 +37,12 @@ class PrepareImageTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "height and one width"):
             prepare_image_for_model(np.zeros((2, 3)), [1, None, None, 1], ["batch", None, None, "channel"])
 
+    def test_accepts_static_single_channel_hwc_without_dimension_names(self):
+        arr = np.arange(6, dtype=np.int32).reshape(2, 3)
+        out = prepare_image_for_model(arr, [2, 3, 1], [None, None, None])
+        self.assertEqual(out.shape, (2, 3, 1))
+        np.testing.assert_array_equal(out[:, :, 0], arr)
+
 
 class DTypeTests(unittest.TestCase):
     def test_resolve_uint16(self):

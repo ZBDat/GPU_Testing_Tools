@@ -261,10 +261,15 @@ def prepare_image_for_model(
 
     spatial_axes = [_spatial_axis(name) for name in dim_names]
     if spatial_axes.count("height") != 1 or spatial_axes.count("width") != 1:
-        raise ValueError(
-            "Model input must expose exactly one height and one width dimension name; "
-            f"received dimension names {list(dim_names)}"
-        )
+        # Static ONNX dimensions replace symbolic names. Accept only the
+        # unambiguous HWC form used by this tool's single-channel TIFF models.
+        if len(target_shape) == 3 and target_shape[2] == 1 and all(name is None for name in dim_names):
+            spatial_axes = ["height", "width", None]
+        else:
+            raise ValueError(
+                "Model input must expose exactly one height and one width dimension name; "
+                f"received dimension names {list(dim_names)}"
+            )
 
     height, width = image.shape
     output_shape = []

@@ -77,9 +77,33 @@ python analyze_nsys_trace.py profile \
   --output two_sender_four_worker_trace
 ```
 
+PowerShell 可直接执行默认的静态模型 120 秒采集与分析：
+
+```powershell
+.\profile_static_model.ps1
+```
+
+例如指定 30 秒、TensorRT EP 和不同输出名称：
+
+```powershell
+.\profile_static_model.ps1 -DurationSeconds 30 -ExecutionProvider tensorrt -Output trt_static_30s
+```
+
 分析已有报告：
 
 ```bash
 python analyze_nsys_trace.py analyze \
   --report two_sender_four_worker_no_event_trace.nsys-rep
+```
+
+### 固定输入尺寸 ONNX 优化
+
+当全部 TIFF 尺寸固定时，可将模型的动态高宽静态化，并由 ONNX Simplifier 折叠 shape/anchor 相关的常量计算。原模型不会被覆盖：
+
+```bash
+python make_static_onnx.py \
+  --model model_trt.onnx \
+  --output model_trt_static_1108x2232.onnx \
+  --height 1108 \
+  --width 2232
 ```

@@ -13,10 +13,12 @@ from gpu_testing_tool import (
     prepare_image_for_model,
     run_direct_concurrent_groups,
     run_inference_batch,
+    run_worker_concurrent_groups,
     run_two_sender_jobs,
     resolve_numpy_dtype,
     ScenarioResult,
     get_environment_info,
+    _is_oom_error,
     write_results_to_excel,
 )
 
@@ -79,7 +81,17 @@ class RecordingWorker:
         result_queue.put(InferenceOutcome(result=InferenceResult(image_name, 0.0)))
 
 
+class TimedRecordingWorker(RecordingWorker):
+    def submit(self, image_name, _arr, result_queue, on_start=None):
+        if on_start is not None:
+            on_start()
+        super().submit(image_name, _arr, result_queue)
+
+
 class ExecutionTests(unittest.TestCase):
+    def test_bad_allocation_is_classified_as_oom(self):
+        self.assertTrue(_is_oom_error(RuntimeError("Concat failed: bad allocation")))
+
     def test_worker_exception_is_returned_to_caller(self):
         worker = SessionWorker(0, FailingSession(), "input")
         worker.start()
@@ -97,6 +109,14 @@ class ExecutionTests(unittest.TestCase):
         results = run_direct_concurrent_groups(session, "input", images, concurrency=3)
         self.assertEqual(len(results), 1)
         self.assertGreaterEqual(session.max_active, 2)
+
+    def test_worker_groups_use_first_worker_start_as_request_start(self):
+        workers = [TimedRecordingWorker(), TimedRecordingWorker()]
+        images = [(str(i), np.zeros((1,), dtype=np.float32), (1,)) for i in range(3)]
+        results = run_worker_concurrent_groups(workers, images, task_concurrency=2)
+        self.assertEqual([result.image_name for result in results], ["request_group_1", "request_group_2"])
+        self.assertEqual(len(workers[0].submit_times), 2)
+        self.assertEqual(len(workers[1].submit_times), 1)
 
     def test_two_senders_keep_fixed_submission_cadence(self):
         workers = [RecordingWorker(), RecordingWorker()]

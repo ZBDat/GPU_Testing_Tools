@@ -1,4 +1,5 @@
 import argparse
+import gc
 import os
 import queue
 import re
@@ -6,7 +7,7 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -166,18 +167,26 @@ class SessionWorker(threading.Thread):
         self.worker_id = worker_id
         self.session = session
         self.input_name = input_name
-        self.tasks: "queue.Queue[Tuple[Optional[str], Optional[np.ndarray], Optional[queue.Queue]]]" = queue.Queue()
+        self.tasks: "queue.Queue[Tuple[Optional[str], Optional[np.ndarray], Optional[queue.Queue], Optional[Callable[[], None]]]]" = queue.Queue()
         self._stop_event = threading.Event()
 
-    def submit(self, image_name: str, arr: np.ndarray, result_queue: queue.Queue):
-        self.tasks.put((image_name, arr, result_queue))
+    def submit(
+        self,
+        image_name: str,
+        arr: np.ndarray,
+        result_queue: queue.Queue,
+        on_start: Optional[Callable[[], None]] = None,
+    ):
+        self.tasks.put((image_name, arr, result_queue, on_start))
 
     def run(self):
         while not self._stop_event.is_set():
-            image_name, arr, result_queue = self.tasks.get()
+            image_name, arr, result_queue, on_start = self.tasks.get()
             if image_name is None or arr is None or result_queue is None:
                 return
             try:
+                if on_start is not None:
+                    on_start()
                 start = time.perf_counter()
                 self.session.run(None, {self.input_name: arr})
                 latency = (time.perf_counter() - start) * 1000.0
@@ -187,7 +196,7 @@ class SessionWorker(threading.Thread):
 
     def stop(self):
         self._stop_event.set()
-        self.tasks.put((None, None, None))
+        self.tasks.put((None, None, None, None))
 
 
 def parse_args() -> argparse.Namespace:
@@ -382,11 +391,19 @@ def run_direct_concurrent_groups(
     ):
         result_queue: "queue.Queue[InferenceOutcome]" = queue.Queue()
         start_gate = threading.Event()
+        request_started: List[Optional[float]] = [None]
+        request_start_lock = threading.Lock()
+
+        def record_request_start():
+            with request_start_lock:
+                if request_started[0] is None:
+                    request_started[0] = time.perf_counter()
 
         def send(image_name: str, arr: np.ndarray):
             start_gate.wait()
             try:
                 start = time.perf_counter()
+                record_request_start()
                 session.run(None, {input_name: arr})
                 result_queue.put(InferenceOutcome(result=InferenceResult(image_name, (time.perf_counter() - start) * 1000.0)))
             except BaseException as exc:
@@ -395,16 +412,54 @@ def run_direct_concurrent_groups(
         senders = [threading.Thread(target=send, args=(name, arr)) for name, arr, _ in group]
         for sender in senders:
             sender.start()
-        start = time.perf_counter()
         start_gate.set()
+        try:
+            for _ in group:
+                _get_outcome(result_queue, f"concurrent request group {group_idx}")
+        finally:
+            for sender in senders:
+                sender.join(timeout=RESULT_TIMEOUT_SECONDS)
+                if sender.is_alive():
+                    raise TimeoutError(f"Sender thread did not exit for request group {group_idx}")
+        group_results.append(
+            InferenceResult(
+                image_name=f"request_group_{group_idx}",
+                latency_ms=(time.perf_counter() - (request_started[0] or time.perf_counter())) * 1000.0,
+            )
+        )
+    return group_results
+
+
+def run_worker_concurrent_groups(
+    workers: List[SessionWorker],
+    prepared_images: List[Tuple[str, np.ndarray, Tuple[int, ...]]],
+    task_concurrency: int,
+) -> List[InferenceResult]:
+    """Measure each request from the first worker start through its final completion."""
+    group_results: List[InferenceResult] = []
+    for group_idx, group in enumerate(
+        (prepared_images[i : i + task_concurrency] for i in range(0, len(prepared_images), task_concurrency)), start=1
+    ):
+        result_queue: "queue.Queue[InferenceOutcome]" = queue.Queue()
+        request_started: List[Optional[float]] = [None]
+        request_start_lock = threading.Lock()
+
+        def record_request_start():
+            with request_start_lock:
+                if request_started[0] is None:
+                    request_started[0] = time.perf_counter()
+
+        for image_idx, (image_name, arr, _) in enumerate(group):
+            workers[image_idx % len(workers)].submit(image_name, arr, result_queue, record_request_start)
         for _ in group:
             _get_outcome(result_queue, f"concurrent request group {group_idx}")
-        for sender in senders:
-            sender.join(timeout=RESULT_TIMEOUT_SECONDS)
-            if sender.is_alive():
-                raise TimeoutError(f"Sender thread did not exit for request group {group_idx}")
+        if request_started[0] is None:
+            raise RuntimeError(f"No worker started concurrent request group {group_idx}")
         group_results.append(
-            InferenceResult(image_name=f"request_group_{group_idx}", latency_ms=(time.perf_counter() - start) * 1000.0)
+            InferenceResult(
+                image_name=f"request_group_{group_idx}",
+                latency_ms=(time.perf_counter() - request_started[0]) * 1000.0,
+            )
         )
     return group_results
 
@@ -493,17 +548,35 @@ def scenario2_task_concurrency(
     max_concurrency: int,
     gpu_index: int,
 ) -> List[ScenarioResult]:
-    session = create_session(model_path, ep)
     all_results: List[ScenarioResult] = []
     for concurrency in range(2, max_concurrency + 1):
         print_status(f"scenario2 running concurrency={concurrency}/{max_concurrency}")
+        # Use a fresh session for every level so allocator arenas from a lower
+        # concurrency test do not inflate or fragment the next level's memory use.
+        session = create_session(model_path, ep)
         monitor = GPUMonitor(gpu_index)
         monitor.start()
         try:
             results = run_direct_concurrent_groups(session, input_name, prepared_images, concurrency)
+        except Exception as exc:
+            if not _is_oom_error(exc):
+                raise
+            print_status(f"scenario2 OOM detected at concurrency={concurrency}, stopping task scaling")
+            all_results.append(
+                ScenarioResult(
+                    scenario_name=f"scenario2_task_concurrency_{concurrency}_oom",
+                    details="OOM detected and recovered",
+                    per_image=[],
+                    peak_memory_mb=monitor.peak_memory_bytes / (1024 * 1024),
+                    peak_bandwidth_percent=monitor.peak_bandwidth_percent,
+                )
+            )
+            break
         finally:
             monitor.stop()
             monitor.close()
+            del session
+            gc.collect()
         all_results.append(
             ScenarioResult(
                 scenario_name=f"scenario2_task_concurrency_{concurrency}",
@@ -519,7 +592,14 @@ def scenario2_task_concurrency(
 
 def _is_oom_error(exc: BaseException) -> bool:
     msg = str(exc).lower()
-    return "out of memory" in msg or "oom" in msg or "cuda error 2" in msg
+    return (
+        "out of memory" in msg
+        or "oom" in msg
+        or "cuda error 2" in msg
+        or "bad allocation" in msg
+        or "bad_alloc" in msg
+        or "cannot allocate memory" in msg
+    )
 
 
 def scenario3_session_concurrency(
@@ -528,6 +608,7 @@ def scenario3_session_concurrency(
     input_name: str,
     prepared_images: List[Tuple[str, np.ndarray, Tuple[int, ...]]],
     max_sessions: int,
+    task_concurrency: int,
     gpu_index: int,
 ) -> List[ScenarioResult]:
     scenario_results: List[ScenarioResult] = []
@@ -541,17 +622,10 @@ def scenario3_session_concurrency(
                 worker.start()
                 workers.append(worker)
 
-            sender_jobs = [[], []]
-            sender_count = 2
-            for i, (name, arr, _) in enumerate(prepared_images):
-                sender_id = i % sender_count
-                worker_idx = i % session_count
-                sender_jobs[sender_id].append((worker_idx, f"{name}#sender{sender_id}", arr))
-
             monitor = GPUMonitor(gpu_index)
             monitor.start()
             try:
-                results = run_two_sender_jobs(workers, sender_jobs)
+                results = run_worker_concurrent_groups(workers, prepared_images, task_concurrency)
             finally:
                 monitor.stop()
                 monitor.close()
@@ -559,7 +633,7 @@ def scenario3_session_concurrency(
             scenario_results.append(
                 ScenarioResult(
                     scenario_name=f"scenario3_session_concurrency_{session_count}",
-                    details=f"two_sender_threads_{session_count}_sessions",
+                    details=f"task_concurrency_{task_concurrency}_{session_count}_sessions",
                     per_image=results,
                     peak_memory_mb=monitor.peak_memory_bytes / (1024 * 1024),
                     peak_bandwidth_percent=monitor.peak_bandwidth_percent,
@@ -792,7 +866,15 @@ def main():
     print_status("scenario 2 completed")
     print_status("running scenario 3: session concurrency")
     all_results.extend(
-        scenario3_session_concurrency(args.model, args.ep, input_name, prepared_images, args.max_session_concurrency, args.gpu_index)
+        scenario3_session_concurrency(
+            args.model,
+            args.ep,
+            input_name,
+            prepared_images,
+            args.max_session_concurrency,
+            args.max_task_concurrency,
+            args.gpu_index,
+        )
     )
     print_status("scenario 3 completed")
     print_status("running scenario 4: fixed interval")

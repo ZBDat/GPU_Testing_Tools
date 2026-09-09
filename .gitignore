@@ -223,3 +223,10 @@ images
 *.rep
 *.sql
 *.md
+
+backbone_features
+conv1_kernels
+extract_backbone_features.py
+extract_conv1_kernel.py
+visualize_c2_channels.py
+

@@ -6,11 +6,13 @@ Benchmarking a GPU's performance for my use case.
 新增 `gpu_testing_tool.py`，用于对 ONNX 模型执行以下场景测试并统一输出 Excel：
 
 1. 单 session 顺序推理（逐图统计耗时）
+   - 1b：读取模型的静态 batch 维度后批量推理；尾批使用零图补齐。没有静态 batch 大小大于 1 的模型会记录为不支持。
 2. 单 session 任务并发（并发从 2 递增到用户设定上限；每个请求由独立发送线程直接调用同一 ONNX Runtime session）
 3. session 并发（2 个真实发送线程 + 多 session，session 数从 2 递增直到 OOM，OOM 后停止扩容并继续后续场景）
 4. 固定间隔双发送线程场景
-   - 4a：单 session
-   - 4b：双 session（每个 session 固定对应一个发送线程）
+    - 4a：单 session
+    - 4b：双 session（每个 session 固定对应一个发送线程）
+5. 单图全 session 并发：每张图同时发送至 `--max-session-concurrency` 个独立 session，统计从任一 session 开始处理到全部 session 完成的时间。
 
 每个小场景都记录：
 - 场景 1：单图推理耗时（不含图像读取时间）
@@ -44,8 +46,9 @@ python gpu_testing_tool.py \
   --output-excel /path/to/result.xlsx \
   --ep cuda \
   --max-task-concurrency 8 \
-  --max-session-concurrency 8 \
-  --interval-ms 100
+   --max-session-concurrency 8 \
+   --interval-ms 100 \
+   --pad
 ```
 
 ### Nsight Systems 连续执行

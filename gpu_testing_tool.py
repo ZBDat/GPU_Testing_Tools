@@ -6,7 +6,7 @@ import re
 import subprocess
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -73,6 +73,18 @@ class ScenarioResult:
     per_image: List[InferenceResult]
     peak_memory_mb: float
     peak_bandwidth_percent: float
+    task_traces: List["TaskTrace"] = field(default_factory=list)
+
+
+@dataclass
+class TaskTrace:
+    request_group: int
+    image_name: str
+    sender_id: int
+    worker_id: int
+    sent_ms: float
+    processing_started_ms: Optional[float] = None
+    processing_completed_ms: Optional[float] = None
 
 
 class GPUMonitor:
@@ -167,7 +179,7 @@ class SessionWorker(threading.Thread):
         self.worker_id = worker_id
         self.session = session
         self.input_name = input_name
-        self.tasks: "queue.Queue[Tuple[Optional[str], Optional[np.ndarray], Optional[queue.Queue], Optional[Callable[[], None]]]]" = queue.Queue()
+        self.tasks: "queue.Queue[Tuple[Optional[str], Optional[np.ndarray], Optional[queue.Queue], Optional[Callable[[int], None]], Optional[Callable[[int], None]]]]" = queue.Queue()
         self._stop_event = threading.Event()
 
     def submit(
@@ -175,28 +187,31 @@ class SessionWorker(threading.Thread):
         image_name: str,
         arr: np.ndarray,
         result_queue: queue.Queue,
-        on_start: Optional[Callable[[], None]] = None,
+        on_start: Optional[Callable[[int], None]] = None,
+        on_complete: Optional[Callable[[int], None]] = None,
     ):
-        self.tasks.put((image_name, arr, result_queue, on_start))
+        self.tasks.put((image_name, arr, result_queue, on_start, on_complete))
 
     def run(self):
         while not self._stop_event.is_set():
-            image_name, arr, result_queue, on_start = self.tasks.get()
+            image_name, arr, result_queue, on_start, on_complete = self.tasks.get()
             if image_name is None or arr is None or result_queue is None:
                 return
             try:
                 if on_start is not None:
-                    on_start()
+                    on_start(self.worker_id)
                 start = time.perf_counter()
                 self.session.run(None, {self.input_name: arr})
                 latency = (time.perf_counter() - start) * 1000.0
+                if on_complete is not None:
+                    on_complete(self.worker_id)
                 result_queue.put(InferenceOutcome(result=InferenceResult(image_name=image_name, latency_ms=latency)))
             except BaseException as exc:
                 result_queue.put(InferenceOutcome(error=exc))
 
     def stop(self):
         self._stop_event.set()
-        self.tasks.put((None, None, None, None))
+        self.tasks.put((None, None, None, None, None))
 
 
 def parse_args() -> argparse.Namespace:
@@ -209,6 +224,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-session-concurrency", type=int, default=8, help="Scenario 3 max sessions")
     parser.add_argument("--interval-ms", type=int, default=100, help="Scenario 4 sender interval")
     parser.add_argument("--max-images", type=int, default=0, help="Optional cap of images to use")
+    parser.add_argument("--pad", action="store_true", help="Pad image height and width up to multiples of 128")
     parser.add_argument("--gpu-index", type=int, default=0, help="GPU index to monitor")
     args = parser.parse_args()
     if args.max_task_concurrency < 2:
@@ -250,10 +266,19 @@ def _spatial_axis(dim_name: Optional[str]) -> Optional[str]:
     if dim_name is None:
         return None
     normalized = dim_name.strip().lower().replace("_", "").replace("-", "")
-    if normalized in {"h", "height", "imageheight"}:
+    if normalized in {"h", "height", "imageheight", "d0"}:
         return "height"
-    if normalized in {"w", "width", "imagewidth"}:
+    if normalized in {"w", "width", "imagewidth", "d1"}:
         return "width"
+    return None
+
+
+def get_batch_axis(target_shape: Sequence[Optional[int]], dim_names: Sequence[Optional[str]]) -> Optional[int]:
+    for axis, dim_name in enumerate(dim_names):
+        if dim_name is not None and dim_name.strip().lower().replace("_", "") in {"batch", "batchsize", "n"}:
+            return axis
+    if len(target_shape) == 4 and target_shape[-1] == 1:
+        return 0
     return None
 
 
@@ -261,8 +286,9 @@ def prepare_image_for_model(
     image: np.ndarray,
     target_shape: Sequence[Optional[int]],
     dim_names: Sequence[Optional[str]],
+    pad_to_128: bool = False,
 ) -> np.ndarray:
-    """Map a 2D TIFF to named model axes without changing its spatial pixels."""
+    """Map a 2D TIFF to named model axes, optionally zero-padding bottom and right edges."""
     if image.ndim != 2:
         raise ValueError(f"Only 2D TIFF images are supported; received shape {image.shape}")
     if len(target_shape) != len(dim_names):
@@ -279,12 +305,21 @@ def prepare_image_for_model(
                 "Model input must expose exactly one height and one width dimension name; "
                 f"received dimension names {list(dim_names)}"
             )
+    batch_axis = get_batch_axis(target_shape, dim_names)
 
     height, width = image.shape
+    if pad_to_128:
+        padded_height = ((height + 127) // 128) * 128
+        padded_width = ((width + 127) // 128) * 128
+        if (padded_height, padded_width) != (height, width):
+            padded = np.zeros((padded_height, padded_width), dtype=image.dtype)
+            padded[:height, :width] = image
+            image = padded
+            height, width = image.shape
     output_shape = []
     for axis, (target_dim, spatial_axis) in enumerate(zip(target_shape, spatial_axes)):
         actual_dim = height if spatial_axis == "height" else width if spatial_axis == "width" else 1
-        if target_dim is not None and target_dim > 0 and target_dim != actual_dim:
+        if axis != batch_axis and target_dim is not None and target_dim > 0 and target_dim != actual_dim:
             raise ValueError(
                 f"Image shape {image.shape} is incompatible with model axis {axis} ({dim_names[axis]!r}): "
                 f"expected {target_dim}, received {actual_dim}. Images are never cropped or padded."
@@ -299,12 +334,48 @@ def prepare_image_for_model(
     return output
 
 
+def assemble_image_batch(
+    images: Sequence[np.ndarray],
+    batch_axis: int,
+    dim_names: Sequence[Optional[str]],
+    batch_size: int,
+) -> np.ndarray:
+    """Pad spatial dimensions within a batch and append zero-valued tail samples."""
+    if not images:
+        raise ValueError("Cannot assemble an empty image batch")
+    if len(images) > batch_size:
+        raise ValueError(f"Received {len(images)} images for batch size {batch_size}")
+
+    output_shape = list(images[0].shape)
+    output_shape[batch_axis] = batch_size
+    spatial_axes = {axis for axis, dim_name in enumerate(dim_names) if _spatial_axis(dim_name) is not None}
+    for image in images[1:]:
+        if image.ndim != len(output_shape):
+            raise ValueError(f"All batch images must have rank {len(output_shape)}, received {image.shape}")
+        for axis, size in enumerate(image.shape):
+            if axis == batch_axis:
+                if size != 1:
+                    raise ValueError(f"Each prepared image must have batch size 1, received {image.shape}")
+            elif axis in spatial_axes:
+                output_shape[axis] = max(output_shape[axis], size)
+            elif size != output_shape[axis]:
+                raise ValueError(f"Cannot batch images with different non-spatial shapes: {images[0].shape}, {image.shape}")
+
+    batch = np.zeros(output_shape, dtype=images[0].dtype)
+    for batch_index, image in enumerate(images):
+        destination = [slice(0, size) for size in image.shape]
+        destination[batch_axis] = slice(batch_index, batch_index + 1)
+        batch[tuple(destination)] = image
+    return batch
+
+
 def load_and_prepare_images(
     image_dir: str,
     target_shape: Sequence[Optional[int]],
     dim_names: Sequence[Optional[str]],
     target_dtype: np.dtype,
     max_images: int,
+    pad_to_128: bool = False,
 ) -> List[Tuple[str, np.ndarray, Tuple[int, ...]]]:
     if tifffile is None:
         raise RuntimeError("tifffile is required to run this tool")
@@ -322,7 +393,7 @@ def load_and_prepare_images(
         path = os.path.join(image_dir, f)
         original = np.asarray(tifffile.imread(path))
         original_shape = tuple(original.shape)
-        img = prepare_image_for_model(original, target_shape, dim_names)
+        img = prepare_image_for_model(original, target_shape, dim_names, pad_to_128)
         img = img.astype(target_dtype, copy=False)
         prepared.append((f, img, original_shape))
     return prepared
@@ -444,7 +515,7 @@ def run_worker_concurrent_groups(
         request_started: List[Optional[float]] = [None]
         request_start_lock = threading.Lock()
 
-        def record_request_start():
+        def record_request_start(_worker_id: int):
             with request_start_lock:
                 if request_started[0] is None:
                     request_started[0] = time.perf_counter()
@@ -464,25 +535,82 @@ def run_worker_concurrent_groups(
     return group_results
 
 
+def run_same_image_all_sessions(
+    workers: List[SessionWorker],
+    prepared_images: List[Tuple[str, np.ndarray, Tuple[int, ...]]],
+) -> List[InferenceResult]:
+    """Run one image on every session and time first processing start through final completion."""
+    results: List[InferenceResult] = []
+    for image_name, arr, _ in prepared_images:
+        result_queue: "queue.Queue[InferenceOutcome]" = queue.Queue()
+        request_started: List[Optional[float]] = [None]
+        request_start_lock = threading.Lock()
+
+        def record_request_start(_worker_id: int):
+            with request_start_lock:
+                if request_started[0] is None:
+                    request_started[0] = time.perf_counter()
+
+        for worker in workers:
+            worker.submit(image_name, arr, result_queue, record_request_start)
+        for _ in workers:
+            _get_outcome(result_queue, f"all-session inference for {image_name}")
+        if request_started[0] is None:
+            raise RuntimeError(f"No worker started all-session inference for {image_name}")
+        results.append(
+            InferenceResult(
+                image_name=image_name,
+                latency_ms=(time.perf_counter() - request_started[0]) * 1000.0,
+            )
+        )
+    return results
+
+
 def run_two_sender_jobs(
     workers: List[SessionWorker],
     sender_jobs: List[List[Tuple[int, str, np.ndarray]]],
     interval_ms: Optional[int] = None,
-) -> List[InferenceResult]:
-    """Submit work from two independent senders at a shared arrival cadence."""
+) -> Tuple[List[InferenceResult], List[TaskTrace]]:
+    """Submit work from two senders and capture send, start, and completion times."""
     result_queue: "queue.Queue[InferenceOutcome]" = queue.Queue()
     start_gate = threading.Event()
     scheduled_start = [0.0]
+    traces: List[TaskTrace] = []
+    trace_lock = threading.Lock()
 
-    def send(jobs: List[Tuple[int, str, np.ndarray]]):
+    def send(sender_id: int, jobs: List[Tuple[int, str, np.ndarray]]):
         start_gate.wait()
         for round_idx, (worker_idx, image_name, arr) in enumerate(jobs):
             if interval_ms is not None:
                 deadline = scheduled_start[0] + round_idx * interval_ms / 1000.0
                 time.sleep(max(0.0, deadline - time.perf_counter()))
-            workers[worker_idx].submit(f"request_group_{round_idx + 1}:{image_name}", arr, result_queue)
+            trace = TaskTrace(
+                request_group=round_idx + 1,
+                image_name=image_name,
+                sender_id=sender_id,
+                worker_id=worker_idx,
+                sent_ms=(time.perf_counter() - scheduled_start[0]) * 1000.0,
+            )
 
-    senders = [threading.Thread(target=send, args=(jobs,)) for jobs in sender_jobs]
+            def record_start(actual_worker_id: int, task_trace: TaskTrace = trace):
+                task_trace.processing_started_ms = (time.perf_counter() - scheduled_start[0]) * 1000.0
+                task_trace.worker_id = actual_worker_id
+
+            def record_complete(actual_worker_id: int, task_trace: TaskTrace = trace):
+                task_trace.processing_completed_ms = (time.perf_counter() - scheduled_start[0]) * 1000.0
+                task_trace.worker_id = actual_worker_id
+
+            with trace_lock:
+                traces.append(trace)
+            workers[worker_idx].submit(
+                f"request_group_{round_idx + 1}:{image_name}",
+                arr,
+                result_queue,
+                record_start,
+                record_complete,
+            )
+
+    senders = [threading.Thread(target=send, args=(sender_id, jobs)) for sender_id, jobs in enumerate(sender_jobs)]
     for sender in senders:
         sender.start()
     scheduled_start[0] = time.perf_counter()
@@ -502,13 +630,14 @@ def run_two_sender_jobs(
         if sender.is_alive():
             raise TimeoutError("Sender thread did not exit")
 
-    return [
+    results = [
         InferenceResult(
             image_name=f"request_group_{round_idx}",
             latency_ms=(end_time - (scheduled_start[0] + (round_idx - 1) * (interval_ms or 0) / 1000.0)) * 1000.0,
         )
         for round_idx, end_time in sorted(group_end_times.items())
     ]
+    return results, sorted(traces, key=lambda trace: (trace.request_group, trace.sender_id))
 
 
 def scenario1_sequential(
@@ -534,6 +663,52 @@ def scenario1_sequential(
     return ScenarioResult(
         scenario_name="scenario1_sequential",
         details="single_session_sequential_sender",
+        per_image=results,
+        peak_memory_mb=monitor.peak_memory_bytes / (1024 * 1024),
+        peak_bandwidth_percent=monitor.peak_bandwidth_percent,
+    )
+
+
+def scenario1b_batched(
+    model_path: str,
+    ep: str,
+    input_name: str,
+    prepared_images: List[Tuple[str, np.ndarray, Tuple[int, ...]]],
+    target_shape: Sequence[Optional[int]],
+    dim_names: Sequence[Optional[str]],
+    gpu_index: int,
+) -> ScenarioResult:
+    """Run sequential inference using the static batch size declared by the model input."""
+    batch_axis = get_batch_axis(target_shape, dim_names)
+    batch_size = target_shape[batch_axis] if batch_axis is not None else None
+    if batch_axis is None or batch_size is None or batch_size < 2:
+        return ScenarioResult(
+            scenario_name="scenario1b_batched",
+            details="unsupported: model input has no static batch dimension greater than 1",
+            per_image=[],
+            peak_memory_mb=0.0,
+            peak_bandwidth_percent=0.0,
+        )
+
+    session = create_session(model_path, ep)
+    monitor = GPUMonitor(gpu_index)
+    monitor.start()
+    results: List[InferenceResult] = []
+    try:
+        for batch_index, start in enumerate(range(0, len(prepared_images), batch_size), start=1):
+            items = prepared_images[start : start + batch_size]
+            batch = assemble_image_batch([item[1] for item in items], batch_axis, dim_names, batch_size)
+            started = time.perf_counter()
+            session.run(None, {input_name: batch})
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
+            names = ",".join(item[0] for item in items)
+            results.append(InferenceResult(f"batch_{batch_index}_images_{len(items)}:{names}", elapsed_ms))
+    finally:
+        monitor.stop()
+        monitor.close()
+    return ScenarioResult(
+        scenario_name="scenario1b_batched",
+        details=f"static_batch_size_{batch_size}; final batch is zero-padded when incomplete",
         per_image=results,
         peak_memory_mb=monitor.peak_memory_bytes / (1024 * 1024),
         peak_bandwidth_percent=monitor.peak_bandwidth_percent,
@@ -688,7 +863,7 @@ def scenario4_fixed_interval(
                     worker_idx = i % len(workers)
                 sender_jobs[sender_id].append((worker_idx, f"{img_name}#sender{sender_id}", arr))
 
-            results = run_two_sender_jobs(workers, sender_jobs, interval_ms)
+            results, task_traces = run_two_sender_jobs(workers, sender_jobs, interval_ms)
         finally:
             monitor.stop()
             monitor.close()
@@ -699,6 +874,7 @@ def scenario4_fixed_interval(
             per_image=results,
             peak_memory_mb=monitor.peak_memory_bytes / (1024 * 1024),
             peak_bandwidth_percent=monitor.peak_bandwidth_percent,
+            task_traces=task_traces,
         )
         print_status(f"scenario4 completed sub-scenario={name}")
         return result
@@ -727,6 +903,42 @@ def scenario4_fixed_interval(
         for w in [worker_a, worker_b0, worker_b1]:
             w.join(timeout=1.0)
     return [r1, r2]
+
+
+def scenario5_all_sessions_same_image(
+    model_path: str,
+    ep: str,
+    input_name: str,
+    prepared_images: List[Tuple[str, np.ndarray, Tuple[int, ...]]],
+    session_count: int,
+    gpu_index: int,
+) -> ScenarioResult:
+    """Run every image once per session concurrently, using independent sessions."""
+    print_status(f"scenario5 running sessions={session_count}")
+    workers: List[SessionWorker] = []
+    monitor = GPUMonitor(gpu_index)
+    try:
+        for worker_id in range(session_count):
+            worker = SessionWorker(worker_id, create_session(model_path, ep), input_name)
+            worker.start()
+            workers.append(worker)
+        monitor.start()
+        results = run_same_image_all_sessions(workers, prepared_images)
+    finally:
+        monitor.stop()
+        monitor.close()
+        for worker in workers:
+            worker.stop()
+        for worker in workers:
+            worker.join(timeout=1.0)
+    print_status(f"scenario5 completed sessions={session_count}")
+    return ScenarioResult(
+        scenario_name=f"scenario5_same_image_{session_count}_sessions",
+        details=f"single_image_sent_to_all_{session_count}_sessions",
+        per_image=results,
+        peak_memory_mb=monitor.peak_memory_bytes / (1024 * 1024),
+        peak_bandwidth_percent=monitor.peak_bandwidth_percent,
+    )
 
 
 def get_environment_info(
@@ -776,6 +988,9 @@ def write_results_to_excel(
     for sr in scenario_results:
         sheet_name = sr.scenario_name[:31]
         ws = wb.create_sheet(title=sheet_name)
+        trimmed_latencies = [result.latency_ms for result in sr.per_image[1:-1]]
+        trimmed_mean = sum(trimmed_latencies) / len(trimmed_latencies) if trimmed_latencies else "N/A"
+        trimmed_max = max(trimmed_latencies) if trimmed_latencies else "N/A"
         ws.append(["scenario_name", sr.scenario_name])
         ws.append(["details", sr.details])
         ws.append(["cuda_version", env_info["cuda_version"]])
@@ -786,6 +1001,8 @@ def write_results_to_excel(
         ws.append(["model_input_shape", env_info["model_input_shape"]])
         ws.append(["peak_memory_mb", sr.peak_memory_mb])
         ws.append(["peak_bandwidth_percent", sr.peak_bandwidth_percent])
+        ws.append(["time_average_excluding_first_and_last_ms", trimmed_mean])
+        ws.append(["time_max_excluding_first_and_last_ms", trimmed_max])
         ws.append([])
         if sr.scenario_name.startswith(("scenario2_", "scenario3_", "scenario4")):
             ws.append(["request_group", "processing_time_ms"])
@@ -793,6 +1010,41 @@ def write_results_to_excel(
             ws.append(["image_name", "latency_ms"])
         for row in sr.per_image:
             ws.append([row.image_name, row.latency_ms])
+        if sr.task_traces:
+            ws.append([])
+            ws.append(
+                [
+                    "request_group",
+                    "image_name",
+                    "sender_id",
+                    "worker_id",
+                    "sent_ms",
+                    "processing_started_ms",
+                    "processing_completed_ms",
+                    "queue_wait_ms",
+                    "processing_time_ms",
+                ]
+            )
+            for trace in sr.task_traces:
+                queue_wait_ms = None
+                processing_time_ms = None
+                if trace.processing_started_ms is not None:
+                    queue_wait_ms = trace.processing_started_ms - trace.sent_ms
+                if trace.processing_completed_ms is not None and trace.processing_started_ms is not None:
+                    processing_time_ms = trace.processing_completed_ms - trace.processing_started_ms
+                ws.append(
+                    [
+                        trace.request_group,
+                        trace.image_name,
+                        trace.sender_id,
+                        trace.worker_id,
+                        trace.sent_ms,
+                        trace.processing_started_ms,
+                        trace.processing_completed_ms,
+                        queue_wait_ms,
+                        processing_time_ms,
+                    ]
+                )
 
     wb.save(output_path)
 
@@ -842,7 +1094,14 @@ def main():
     dim_names = onnx_dim_names if onnx_dim_names else [None] * len(target_shape)
     target_dtype = resolve_numpy_dtype(input_meta.type)
     print_status("loading and preparing images")
-    prepared_images = load_and_prepare_images(args.image_dir, target_shape, dim_names, target_dtype, args.max_images)
+    prepared_images = load_and_prepare_images(
+        args.image_dir,
+        target_shape,
+        dim_names,
+        target_dtype,
+        args.max_images,
+        args.pad,
+    )
     print_status(f"prepared_images={len(prepared_images)}")
     first_image_path = os.path.join(args.image_dir, prepared_images[0][0])
 
@@ -851,7 +1110,7 @@ def main():
         f"shape={target_shape}, dim_names={dim_names}, dtype={target_dtype}"
     )
     print_status(
-        f"first_image_original_shape={prepared_images[0][2]}, model_input_shape={prepared_images[0][1].shape}"
+        f"first_image_original_shape={prepared_images[0][2]}, model_input_shape={prepared_images[0][1].shape}, pad={args.pad}"
     )
     print_single_inference_verification(probe_session, input_name, prepared_images[0][0], prepared_images[0][1])
 
@@ -859,6 +1118,19 @@ def main():
     print_status("running scenario 1: sequential")
     all_results.append(scenario1_sequential(args.model, args.ep, input_name, prepared_images, args.gpu_index))
     print_status("scenario 1 completed")
+    print_status("running scenario 1b: batched")
+    all_results.append(
+        scenario1b_batched(
+            args.model,
+            args.ep,
+            input_name,
+            prepared_images,
+            target_shape,
+            dim_names,
+            args.gpu_index,
+        )
+    )
+    print_status("scenario 1b completed")
     print_status("running scenario 2: task concurrency")
     all_results.extend(
         scenario2_task_concurrency(args.model, args.ep, input_name, prepared_images, args.max_task_concurrency, args.gpu_index)
@@ -882,6 +1154,18 @@ def main():
         scenario4_fixed_interval(args.model, args.ep, input_name, prepared_images, args.interval_ms, args.gpu_index)
     )
     print_status("scenario 4 completed")
+    print_status("running scenario 5: same image on all sessions")
+    all_results.append(
+        scenario5_all_sessions_same_image(
+            args.model,
+            args.ep,
+            input_name,
+            prepared_images,
+            args.max_session_concurrency,
+            args.gpu_index,
+        )
+    )
+    print_status("scenario 5 completed")
 
     print_status("collecting environment information")
     env_info = get_environment_info(

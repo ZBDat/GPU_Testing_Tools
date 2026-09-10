@@ -11,8 +11,11 @@ from gpu_testing_tool import (
     InferenceResult,
     SessionWorker,
     prepare_image_for_model,
+    assemble_image_batch,
+    get_batch_axis,
     run_direct_concurrent_groups,
     run_inference_batch,
+    run_same_image_all_sessions,
     run_worker_concurrent_groups,
     run_two_sender_jobs,
     resolve_numpy_dtype,
@@ -45,6 +48,32 @@ class PrepareImageTests(unittest.TestCase):
         self.assertEqual(out.shape, (2, 3, 1))
         np.testing.assert_array_equal(out[:, :, 0], arr)
 
+    def test_accepts_generic_onnx_hwc_dimension_names(self):
+        arr = np.arange(6, dtype=np.uint16).reshape(2, 3)
+        out = prepare_image_for_model(arr, [1, None, None, 1], [None, "d_0", "d_1", None])
+        self.assertEqual(out.shape, (1, 2, 3, 1))
+        np.testing.assert_array_equal(out[0, :, :, 0], arr)
+
+    def test_pads_height_and_width_to_multiples_of_128(self):
+        arr = np.arange(6, dtype=np.uint16).reshape(2, 3)
+        out = prepare_image_for_model(arr, [None, None, 1], ["height", "width", None], pad_to_128=True)
+        self.assertEqual(out.shape, (128, 128, 1))
+        np.testing.assert_array_equal(out[:2, :3, 0], arr)
+        self.assertTrue(np.all(out[2:, :, 0] == 0))
+        self.assertTrue(np.all(out[:, 3:, 0] == 0))
+
+    def test_detects_static_nhwc_batch_axis(self):
+        self.assertEqual(get_batch_axis([4, None, None, 1], [None, "height", "width", None]), 0)
+
+    def test_assembles_batch_with_spatial_and_tail_padding(self):
+        first = np.ones((1, 2, 3, 1), dtype=np.uint16)
+        second = np.full((1, 3, 2, 1), 2, dtype=np.uint16)
+        batch = assemble_image_batch([first, second], 0, ["batch", "height", "width", "channel"], 4)
+        self.assertEqual(batch.shape, (4, 3, 3, 1))
+        np.testing.assert_array_equal(batch[0, :2, :3, 0], first[0, :, :, 0])
+        np.testing.assert_array_equal(batch[1, :3, :2, 0], second[0, :, :, 0])
+        self.assertTrue(np.all(batch[2:] == 0))
+
 
 class DTypeTests(unittest.TestCase):
     def test_resolve_uint16(self):
@@ -76,16 +105,18 @@ class RecordingWorker:
     def __init__(self):
         self.submit_times = []
 
-    def submit(self, image_name, _arr, result_queue):
+    def submit(self, image_name, _arr, result_queue, on_start=None, on_complete=None):
+        if on_start is not None:
+            on_start(0)
         self.submit_times.append((image_name, time.perf_counter()))
+        if on_complete is not None:
+            on_complete(0)
         result_queue.put(InferenceOutcome(result=InferenceResult(image_name, 0.0)))
 
 
 class TimedRecordingWorker(RecordingWorker):
     def submit(self, image_name, _arr, result_queue, on_start=None):
-        if on_start is not None:
-            on_start()
-        super().submit(image_name, _arr, result_queue)
+        super().submit(image_name, _arr, result_queue, on_start=on_start)
 
 
 class ExecutionTests(unittest.TestCase):
@@ -118,13 +149,23 @@ class ExecutionTests(unittest.TestCase):
         self.assertEqual(len(workers[0].submit_times), 2)
         self.assertEqual(len(workers[1].submit_times), 1)
 
+    def test_same_image_is_submitted_to_every_session(self):
+        workers = [TimedRecordingWorker(), TimedRecordingWorker(), TimedRecordingWorker()]
+        images = [("image", np.zeros((1,), dtype=np.float32), (1,))]
+        results = run_same_image_all_sessions(workers, images)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].image_name, "image")
+        self.assertTrue(all(worker.submit_times[0][0] == "image" for worker in workers))
+
     def test_two_senders_keep_fixed_submission_cadence(self):
         workers = [RecordingWorker(), RecordingWorker()]
         jobs = [
             [(0, "a", np.zeros(1)), (0, "c", np.zeros(1))],
             [(1, "b", np.zeros(1)), (1, "d", np.zeros(1))],
         ]
-        run_two_sender_jobs(workers, jobs, interval_ms=30)
+        results, traces = run_two_sender_jobs(workers, jobs, interval_ms=30)
+        self.assertEqual(len(results), 2)
+        self.assertEqual(len(traces), 4)
         for worker in workers:
             self.assertGreaterEqual(worker.submit_times[1][1] - worker.submit_times[0][1], 0.02)
 
@@ -144,11 +185,22 @@ class ExecutionTests(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "results.xlsx"
+            result = ScenarioResult(
+                "scenario4a_test",
+                "details",
+                [InferenceResult("first", 100.0), InferenceResult("second", 40.0), InferenceResult("third", 60.0)],
+                0.0,
+                0.0,
+            )
             write_results_to_excel(str(output), env_info, [result])
             sheet = openpyxl.load_workbook(output).active
-            self.assertEqual(sheet.cell(row=12, column=1).value, "request_group")
+            self.assertEqual(sheet.cell(row=14, column=1).value, "request_group")
             self.assertEqual(sheet.cell(row=7, column=1).value, "original_image_shape")
             self.assertEqual(sheet.cell(row=7, column=2).value, "(100, 200)")
+            self.assertEqual(sheet.cell(row=11, column=1).value, "time_average_excluding_first_and_last_ms")
+            self.assertEqual(sheet.cell(row=11, column=2).value, 40.0)
+            self.assertEqual(sheet.cell(row=12, column=1).value, "time_max_excluding_first_and_last_ms")
+            self.assertEqual(sheet.cell(row=12, column=2).value, 40.0)
 
 
 if __name__ == "__main__":
